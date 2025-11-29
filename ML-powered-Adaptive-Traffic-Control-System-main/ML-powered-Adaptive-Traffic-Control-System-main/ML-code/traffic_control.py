@@ -3,48 +3,76 @@ from tkinter import messagebox
 import cv2
 import numpy as np
 import time
-from ultralytics import YOLO
-from sort import *
-from twilio.rest import Client
 
-# Twilio configuration
-ACCOUNT_SID = "Create a Twilio account"
-AUTH_TOKEN = "get SID,Token,twilio-no"
-TWILIO_PHONE = "********"
-TARGET_PHONE = "+9112345678"
+try:
+    from ultralytics import YOLO
+except ImportError:
+    raise ImportError("Ultralytics YOLO not found, please install with 'pip install ultralytics'")
+
+try:
+    from sort import Sort
+except ImportError:
+    raise ImportError("Sort module not found, please ensure sort.py is available in your directory")
+
+try:
+    from twilio.rest import Client
+except ImportError:
+    raise ImportError("Twilio library not found, please install with 'pip install twilio'")
+
+# Twilio configuration - replace with your credentials
+ACCOUNT_SID = "AC1392258d07bc8403835b9f2574d81f58"
+AUTH_TOKEN = "4b4e31c677738c8dea3634f21abf52d1"
+TWILIO_PHONE = "+13345504338"   # Your Twilio phone number
+TARGET_PHONE = "+1234567890"   # Phone number to send alerts to
+
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
 def send_alert(camera_index):
-    message = client.messages.create(
-        body=f"Alert: Vehicle count exceeded 50 at camera {camera_index + 1}",
-        from_=TWILIO_PHONE,
-        to=TARGET_PHONE
-    )
-
+    try:
+        message = client.messages.create(
+            body=f"Alert: Vehicle count exceeded 50 at camera {camera_index + 1}",
+            from_=TWILIO_PHONE,
+            to=TARGET_PHONE
+        )
+        print(f"Alert sent for camera {camera_index+1}")
+    except Exception as e:
+        print(f"Failed to send alert: {e}")
 
 def start_main_program():
     welcome_window.destroy()  # Close the welcome page
-
+    
+    # Initialize cooldown counters as function attribute
+    start_main_program.cooldown_counters = [0] * 4
+    
     # Load video sources
     video_paths = [
-        "traffic4.mp4",
-        "traffic8.mp4",
-        "traffic3.mp4",
-        "traffic4.mp4"
+        "ML-code/traffic1.mp4",
+        "ML-code/traffic2.mp4",
+        "ML-code/traffic3.mp4",
+        "ML-code/traffic4.mp4"
     ]
     caps = [cv2.VideoCapture(path) for path in video_paths]
 
-    # Load YOLO model
+    # Load YOLO model - ensure the model path is correct relative to script location
     global model
-    model = YOLO('object detection project/yolov8s.pt')
+    model_path = 'object detection project/yolov8s.pt'
+    try:
+        model = YOLO(model_path)
+    except Exception as e:
+        print(f"Failed to load YOLO model from {model_path}: {e}")
+        return
     
     vehicle_classes = {"car", "truck", "motorbike", "bus", "bicycle"}
-
+    
+    # Alert configuration
+    THRESHOLD = 10
+    COOLDOWN_FRAMES = 30  # Reset flag only after 30 frames below threshold
+    
     vehicle_counts = [0 for _ in range(4)]
     tracking_ids = [set() for _ in range(4)]
     trackers = [Sort(max_age=2, min_hits=1, iou_threshold=0.3) for _ in range(4)]
     alert_sent_flags = [False for _ in range(4)]  # Flag to prevent repeated alerts
-    
+
     screen_width, screen_height = 1600, 900
     FRAME_WIDTH, FRAME_HEIGHT = screen_width // 2, screen_height // 2
     LINE_THICKNESS = 4
@@ -57,13 +85,13 @@ def start_main_program():
 
     while True:
         frames, detections_list = [], []
-        emergency_detected = False
 
         for i, cap in enumerate(caps):
             if i == current_video:
                 success, img = cap.read()
             else:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, cap.get(cv2.CAP_PROP_POS_FRAMES) - 1)
+                # Set frame position back by 1 to keep video paused
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(cap.get(cv2.CAP_PROP_POS_FRAMES) - 1, 0))
                 success, img = cap.read()
 
             if not success:
@@ -86,7 +114,6 @@ def start_main_program():
 
                         if currentClass in vehicle_classes and conf > 0.3:
                             detections = np.vstack((detections, np.array([x1, y1, x2, y2, conf])))
-                            # cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Draw bounding box without label
             detections_list.append(detections)
 
         white_background = np.ones((screen_height, screen_width, 3), dtype=np.uint8) * 240
@@ -96,17 +123,21 @@ def start_main_program():
                 continue
 
             if i != current_video:
+                # Update tracking
                 resultsTracker = trackers[i].update(detections)
                 tracking_ids[i] = set(int(result[-1]) for result in resultsTracker)
                 vehicle_counts[i] = len(tracking_ids[i])
 
-                # Alert logic with flag
-                if vehicle_counts[i] > 50:
-                    if not alert_sent_flags[i]:
-                        send_alert(i)
-                        alert_sent_flags[i] = True
-                else:
-                    alert_sent_flags[i] = False
+                # FIXED ALERT LOGIC: Send SMS only once when exceeding 50
+                if vehicle_counts[i] > THRESHOLD and not alert_sent_flags[i]:
+                    send_alert(i)
+                    alert_sent_flags[i] = True  # Block further alerts until reset
+                elif vehicle_counts[i] <= THRESHOLD:
+                    # Count consecutive frames below threshold before resetting flag
+                    start_main_program.cooldown_counters[i] += 1
+                    if start_main_program.cooldown_counters[i] >= COOLDOWN_FRAMES:
+                        alert_sent_flags[i] = False  # Allow new alert cycle
+                        start_main_program.cooldown_counters[i] = 0  # Reset counter
 
                 count_text = f"COUNT: {vehicle_counts[i]}"
                 overlay = img.copy()
@@ -124,7 +155,8 @@ def start_main_program():
                 cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
                 cv2.putText(img, time_text, (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3)
 
-            circle_color = (0, 255, 0) if i == current_video else (0, 255, 255) if i == (current_video + 1) % 4 and time_left <= 7 else (0, 0, 255)
+            circle_color = (0, 255, 0) if i == current_video else (
+                (0, 255, 255) if i == (current_video + 1) % 4 and time_left <= 7 else (0, 0, 255))
             cv2.circle(img, (FRAME_WIDTH - 30, 30), 15, circle_color, -1)
 
             row, col = divmod(i, 2)
